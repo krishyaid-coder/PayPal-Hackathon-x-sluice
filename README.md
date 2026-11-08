@@ -7,313 +7,85 @@
 </p>
 
 <p align="center">
-  <em>The MCP gate that remembers what your agent already saw.</em>
+  <em>PayPal hackathon: block a money call when the payee came from poisoned content.</em>
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/sluice-taint/"><img src="https://img.shields.io/pypi/v/sluice-taint" alt="PyPI version"></a>
+  Built on <a href="https://github.com/krishyaid-coder/sluice">Sluice</a>, the MCP gate that remembers what your agent already saw.
 </p>
 
 ---
 
-Agents do not just answer questions. They reach into files, databases, APIs, and inboxes through MCP. Each hop is another place data can end up where you did not intend.
+An agent reads an invoice, then calls PayPal. MCP has no memory of where that payee email came from. If the file said `Ignore previous instructions` and swapped in an attacker account, `create_invoice` still goes out.
 
-Sluice is the gate on that path. It reads what goes out to tools and what comes back, applies your rules, and keeps a short memory of sensitive values for the rest of the conversation. If the model tries to ship the same value somewhere new, the gate stays shut.
+**Origin gate** is the rule we added for this hackathon:
 
-## How it works
+> A PayPal call that commits or moves money is blocked when its payee can be traced back to content that already tripped a detector in this session.
 
-Every JSON-RPC message passes through one pipeline: recall check → detectors → policy → audit → router.
+We store **fingerprints**, not raw emails. That matches Sluice's existing audit rule: nothing sensitive lands in SQLite.
+
+The full Sluice engine (detectors, taint, presets, dashboard) lives in the parent repo: [krishyaid-coder/sluice](https://github.com/krishyaid-coder/sluice). This tree is that gate, pointed at PayPal sandbox MCP.
+
+## What you will see
+
+Two sandbox business accounts. One poisoned invoice. One clean invoice.
+
+| File | Payee | What happens |
+|---|---|---|
+| `examples/paypal/invoices/invoice_3.md` | `sb-i1yp…@business.example.com` (attacker) | `prompt_injection` fires. Email is fingerprinted. Later `create_invoice` is **blocked**. |
+| `examples/paypal/invoices/invoice_clean.md` | `sb-27qgc…@business.example.com` (vendor) | No detector. Same session, different fingerprint. **Allowed**. |
+
+PayPal never sees the blocked call. The Payments view shows the chain: detector, masked payee, gated argument.
 
 ```mermaid
 flowchart LR
-    subgraph client [Your machine]
-        A[Cursor / Claude / curl]
-    end
-
-    subgraph sluice [Sluice process]
-        T[Transport\nstdio or HTTP]
-        P[Pipeline\nscan + policy + taint]
-        R[Router\npick upstream]
-        D[Dashboard /_sluice/]
-        DB[(audit.db)]
-    end
-
-    subgraph tools [MCP servers]
-        F[filesystem]
-        G[github]
-        M[mock / others]
-    end
-
-    A -->|JSON-RPC| T
-    T --> P
-    P -->|allow| R
-    P -->|block| T
-    P --> DB
-    R --> F
-    R --> G
-    R --> M
-    F --> R
-    G --> R
-    M --> R
-    R --> P
-    P --> T
-    T --> A
-    D --> DB
+    A[Agent] -->|read_file invoice_3.md| F[Filesystem MCP]
+    F -->|Ignore previous instructions + attacker email| S[Sluice]
+    S -->|tag email fingerprint| O[(origin index)]
+    A -->|create_invoice that payee| S
+    S -->|origin hit| X[BLOCK]
+    S -.->|never sent| P[PayPal MCP]
 ```
 
-| Component | Role |
+This is not a blocklist of those two accounts. Invoicing the attacker **without** reading the poisoned file is allowed. Invoicing the vendor **after** reading the poisoned file is still allowed.
+
+## Quick start
+
+```bash
+python3 -m pip install -e ".[dev]"
+export PAYPAL_ACCESS_TOKEN="…"   # sandbox REST token
+python3 -m sluice serve --config examples/paypal/config.yaml
+```
+
+Dashboard: [http://127.0.0.1:4444/_sluice/payments](http://127.0.0.1:4444/_sluice/payments)
+
+Config loads the PayPal preset (`origin` bands, gated arguments) plus filesystem (the invoice folder) and `@paypal/mcp` in SANDBOX.
+
+Pytest covers the gate with no token:
+
+```bash
+python3 -m pytest tests/test_entities.py tests/test_origin_gate.py -q
+```
+
+## How origin tagging works
+
+1. A tool **response** is scanned. Origin tags only when `prompt_injection`, `tool_poisoning`, or `secrets` fired. PII is off in the demo so a normal invoice email is not itself a taint mark.
+2. Emails are extracted, normalized, SHA-256 prefixed. The dashboard shows a mask like `sb-***@business.example.com`.
+3. A later **request** to a money tool (`create_invoice`, `create_order`, `pay_order`, …) is checked against those fingerprints on the gated paths (`primary_recipients[].billing_info.email_address`, `recipient_email`, …).
+4. Hit on `commits_money` / `moves_money` → block. Read-only tools (`list_invoices`, `get_order`) pass through.
+
+Amounts are off by default. A bare `4000` appears in too many documents.
+
+## Repo map
+
+| Path | Why it is here |
 |---|---|
-| `config.yaml` | Upstreams, policy rules, taint, audit path |
-| **Transport** | stdio for desktop clients; HTTP for servers and Docker |
-| **Pipeline** | Taint recall, detector scan, policy action, audit write |
-| **Router** | Forwards allowed messages to the right MCP upstream |
-| **Detectors** | Secrets, PII, tool poisoning, prompt injection, supply-chain installs |
-| **Taint store** | Remembers sensitive values per session; blocks reuse (`taint_leak`) |
-| **Audit / dashboard** | SQLite log + browser UI at `/_sluice/` |
-
-**Desktop (stdio):** `Cursor → sluice stdio → MCP server child process` · **Server (HTTP):** `curl / agent → :4444 → pipeline → upstream MCP`
-
-## What this is (and what it is not)
-
-Most MCP security tools work like a mailbox scanner. They open one envelope, look for a credit card or API key, and decide whether to let that single message through.
-
-Sluice works like a gate with memory. It still scans every message, but it also remembers what sensitive data already entered the session. The second question it asks is different: has this exact value already been inside the conversation, and is it now trying to leave through another tool?
-
-That second question is the whole point. A secret inside a `read_file` response can be legitimate. The same secret inside a later `send_email` call is a leak. Sluice blocks the second moment, not the first.
-
-This is not a hosted service, not an LLM judge, and not a replacement for identity or network access control. It is a local runtime that sits on the MCP wire, enforces YAML policy, writes an audit log to disk, and fronts multiple tool servers from one config.
-
-## A concrete case
-
-Your agent calls `read_file` and the response includes `AKIAIOSFODNN7EXAMPLE`. That is fine. The file really contained it.
-
-Two turns later it calls `send_email` and the body includes the same string. Sluice has no opinion about the first call. It stops the second one because the value already appeared inside this session and is trying to travel again.
-
-<p align="center">
-  <img src="docs/assets/demo.gif" alt="Sluice blocking a cross-tool leak" width="720">
-</p>
-
-Run it yourself: `bash scripts/demo.sh`
-
-## v0.4.0
-
-New in this release:
-
-- **`pseudonymize` policy action** for PII, with full round-trip substitution. The LLM sees stable placeholders like `EMAIL_A`; Sluice restores real values before outbound tool calls reach the server. See [Pseudonymize instead of block](#pseudonymize-instead-of-block) below.
-- **`sluice report`** — per-session summary of sensitive values seen, actions taken, detectors fired. Human, markdown, or JSON. See [See what Sluice caught](#see-what-sluice-caught) below.
-
-<p align="center">
-  <img src="docs/assets/pseudonymize-flow.png" alt="Pseudonymize round trip: tool response contains jane@corp.com, LLM sees EMAIL_A, LLM writes send_email(to=EMAIL_A), tool server receives jane@corp.com" width="820">
-</p>
-
-Full release notes: [docs/releases/v0.4.0.md](docs/releases/v0.4.0.md).
-
-## v0.3.0
-
-New in v0.3.0:
-
-- Policy presets for filesystem, github, slack, postgres, brave-search (`sluice presets`)
-- Read-only HTML dashboard at `/_sluice/`
-- Docker image (`Dockerfile`) for HTTP deployments
-- Integration tests against a mock MCP server in CI
-- Taint v2: JSON-path provenance + propagation graph in audit log
-- Prompt-injection detector on tool responses
-- Supply-chain detector on package-install tool calls (typosquats, direct URLs, optional OSV)
-- Optional OpenTelemetry exporter (`pip install sluice-taint[otel]`)
-- Full streamable HTTP SSE reconnect with `Last-Event-Id`
-
-**Full setup and validation guide:** [docs/guide.md](docs/guide.md)
-
-### Demo
-
-```bash
-bash scripts/demo.sh
-```
-
-Shows Part 1 (secret blocked on outbound) and Part 2 (`read_file` → `send_email` blocked by `taint_leak`). See the video above, or [docs/demo-recording.md](docs/demo-recording.md) to record your own.
-
-### Docker (HTTP mode)
-
-```bash
-sluice init
-# edit config.yaml — set audit.sqlite.path to /var/lib/sluice/audit.db for persistence
-
-docker compose up --build
-# Sluice on http://localhost:4444, dashboard at http://localhost:4444/_sluice/
-```
-
-Pre-built images (after tag push): `ghcr.io/krishyaid-coder/sluice:latest`
-
-```bash
-docker run --rm -p 4444:4444 \
-  -v "$PWD/config.yaml:/etc/sluice/config.yaml:ro" \
-  -v sluice-audit:/var/lib/sluice \
-  ghcr.io/krishyaid-coder/sluice:latest serve --config /etc/sluice/config.yaml --host 0.0.0.0
-```
-
-Desktop clients (Cursor, Claude) use `pip install sluice-taint` and `sluice stdio`, not Docker.
-
-## Pseudonymize instead of block
-
-For PII, a third policy action beyond `block` and `redact`: `pseudonymize`.
-The AI sees stable placeholders like `EMAIL_A` instead of the real values.
-When the AI later issues a tool call using those placeholders, Sluice
-substitutes real values back before the call reaches the tool server.
-
-```yaml
-policy:
-  rules:
-    - detector: "pii.*"
-      action: "pseudonymize"
-
-pseudonym:
-  enabled: true
-  fail_closed_on_reverse: true
-```
-
-Round trip in one sentence: real values on your disk and on the wire, stable
-pseudonyms in the AI's context. See [docs/design/pseudonymization.md](docs/design/pseudonymization.md)
-for the full behavior including limitations.
-
-## v0.1.0
-
-This release ships:
-
-- stdio and HTTP transports with streamable HTTP (MCP 2025-03-26) for remote upstreams
-- Carryover memory across tool calls (`taint_leak`)
-- Secret, PII, and tool-poisoning detectors
-- Per-upstream and per-tool YAML policy
-- SQLite audit log and `sluice logs`
-- CLI: `init`, `serve`, `stdio`, `logs`, `doctor`, `version`
-- Legacy config migration to `config.yaml.upgraded`
-- `${VAR}` expansion in config values
-
-Quick demo script:
-
-```bash
-bash scripts/demo.sh
-```
-
-Performance on a developer laptop (pipeline only, 1 KB messages):
-
-```
-clean  p50=0.02 ms   p95=0.02 ms
-secret p50=0.61 ms   p95=0.85 ms
-```
-
-Reproduce with `python -m sluice.bench.latency`.
-
-## Install
-
-```bash
-pip install sluice-taint
-```
-
-PyPI package: [sluice-taint](https://pypi.org/project/sluice-taint/). The CLI command is still `sluice`.
-
-## Get started
-
-```bash
-sluice init
-sluice serve
-```
-
-The proxy listens on `127.0.0.1:4444` by default. Edit `config.yaml` before you point anything real at it.
-
-### From source
-
-```bash
-git clone https://github.com/krishyaid-coder/sluice
-cd sluice
-pip install -e ".[dev]"
-sluice init
-sluice serve
-```
-
-## Hook up Claude Desktop or Cursor
-
-Run Sluice as the MCP command instead of the tool server directly:
-
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "sluice",
-      "args": ["stdio", "--config", "/absolute/path/to/config.yaml"]
-    }
-  }
-}
-```
-
-Sluice spawns the upstream named in your config and speaks MCP on stdin/stdout.
-
-## Prove it works
-
-With default policy, this should come back as a JSON-RPC error:
-
-```bash
-curl -s -X POST http://127.0.0.1:4444 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/call",
-    "params": {
-      "name": "write_file",
-      "arguments": {"content": "key=AKIAIOSFODNN7EXAMPLE"}
-    }
-  }' | jq
-```
-
-## Running multiple tool servers
-
-HTTP mode can front more than one upstream. Send traffic to `POST /u/<upstream-name>` or `POST /` for the default route in `config.yaml`.
-
-## Tooling
-
-`sluice init` scaffolds config.
-
-`sluice serve` starts the HTTP gate.
-
-`sluice stdio` bridges one upstream over stdio for desktop clients.
-
-`sluice logs --since 1h` prints recent decisions from the local SQLite log.
-
-## See what Sluice caught
-
-For a summary of what happened in a session — sensitive values seen,
-where they went, what got blocked — use:
-
-    sluice report
-
-Or for a specific session:
-
-    sluice report --session sess-a3f9b2c1
-
-Add `--format markdown` to paste into a doc, or `--format json` to pipe.
-
-`sluice doctor` loads your config and reports obvious problems.
-
-`sluice version` prints the build.
-
-`sluice presets list|show|apply` manages bundled policy presets.
-
-Open the dashboard at `http://127.0.0.1:4444/_sluice/` while `sluice serve` is running.
-
-## Rules and outcomes
-
-You declare what to do when a pattern fires: refuse the message (`block`), strip the match and continue (`redact`), or allow it but remember the value for later (`flag`).
-
-Built-in matchers know common API keys, tokens, PEM blocks, email and phone shapes, cards and government IDs, noisy high-entropy strings, and suspicious text hiding inside `tools/list` payloads.
-
-When a remembered value shows up again in an outbound call, the refusal reason is `taint_leak`.
-
-Everything runs on your machine. Audit rows land in `~/.sluice/audit.db` unless you point them elsewhere.
-
-## Architecture
-
-See [Architecture.md](Architecture.md) for the full request path and module map.
-
-## License
-
-Apache 2.0
+| `sluice/session/origin.py` | Per-session fingerprint index |
+| `sluice/detectors/entities.py` | Extract / normalize / fingerprint / mask |
+| `sluice/policy/presets/paypal.yaml` | PayPal tool bands and gated arguments |
+| `sluice/proxy/pipeline.py` | Tag on the way in, gate on the way out |
+| `sluice/dashboard/templates/payments.html` | Money-path view |
+| `examples/paypal/` | Sandbox config, invoices, mock MCP |
+| `tests/test_origin_gate.py` | Clean / poison / unrelated payee / not a blocklist |
+
+Sluice itself (stdio/HTTP proxy, detectors, taint, presets, audit) is unchanged in role. Read that story in [the parent README](https://github.com/krishyaid-coder/sluice).
