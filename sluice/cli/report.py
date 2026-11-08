@@ -268,7 +268,7 @@ def report_cmd(
 
     config_path = find_config(str(config) if config else None)
     try:
-        cfg = load_config(config_path)
+        cfg = load_config(config_path, require_env=False)
     except FileNotFoundError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1) from e

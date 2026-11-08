@@ -50,11 +50,15 @@ class StdioTransport:
 
             resp_raw = json.dumps(response.model_dump(exclude_none=True))
             method = request.method
+            req_tool = None
+            if request.params and isinstance(request.params, dict):
+                req_tool = request.params.get("name")
             clean_resp, resp_violation = await pipeline.inspect_response(
                 resp_raw,
                 session_id=self._session_id,
                 upstream=upstream,
                 method=method,
+                tool=req_tool if isinstance(req_tool, str) else None,
             )
 
             if resp_violation and resp_violation.action == "block":

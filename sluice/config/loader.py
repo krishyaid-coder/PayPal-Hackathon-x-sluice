@@ -13,25 +13,27 @@ from sluice.config.schema import SluiceConfig
 _ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 
-def _expand_env(value: str) -> str:
+def _expand_env(value: str, *, require_env: bool = True) -> str:
     def replacer(match: re.Match[str]) -> str:
         var = match.group(1)
         if var not in os.environ:
-            raise ValueError(f"environment variable not set: {var}")
+            if require_env:
+                raise ValueError(f"environment variable not set: {var}")
+            return ""
         return os.environ[var]
 
     return _ENV_PATTERN.sub(replacer, value)
 
 
-def _expand_env_recursive(obj: Any) -> Any:
+def _expand_env_recursive(obj: Any, *, require_env: bool = True) -> Any:
     if isinstance(obj, str):
         if "${" in obj:
-            return _expand_env(obj)
+            return _expand_env(obj, require_env=require_env)
         return obj
     if isinstance(obj, dict):
-        return {k: _expand_env_recursive(v) for k, v in obj.items()}
+        return {k: _expand_env_recursive(v, require_env=require_env) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_expand_env_recursive(v) for v in obj]
+        return [_expand_env_recursive(v, require_env=require_env) for v in obj]
     return obj
 
 
@@ -45,7 +47,9 @@ def _expand_paths(obj: Any) -> Any:
     return obj
 
 
-def load_config(path: str | Path, *, write_migration: bool = True) -> SluiceConfig:
+def load_config(
+    path: str | Path, *, write_migration: bool = True, require_env: bool = True
+) -> SluiceConfig:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"config not found: {path}")
@@ -69,7 +73,7 @@ def load_config(path: str | Path, *, write_migration: bool = True) -> SluiceConf
             )
         raw = migrated
 
-    raw = _expand_env_recursive(raw)
+    raw = _expand_env_recursive(raw, require_env=require_env)
     raw = _expand_paths(raw)
 
     cfg = SluiceConfig.model_validate(raw)

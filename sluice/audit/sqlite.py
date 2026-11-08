@@ -14,6 +14,42 @@ from sluice.session.provenance import PropagationEdge
 
 log = structlog.get_logger()
 
+_EVENT_SELECT = """
+    id, ts, session_id, upstream, direction, method, tool, action,
+    detectors, rule, redacted_preview, latency_us, preset_source, client_ip,
+    propagation, session_step, blocked_by, origin_step, origin_tool,
+    origin_detector, entity_kind, entity_masked, argument_path
+"""
+
+
+def _event_from_row(row: tuple) -> AuditEvent:
+    return AuditEvent(
+        event_id=row[0],
+        ts=row[1],
+        session_id=row[2],
+        upstream=row[3],
+        direction=row[4],
+        method=row[5],
+        tool=row[6],
+        action=row[7],
+        detectors=json.loads(row[8] or "[]"),
+        rule=row[9],
+        redacted_preview=row[10],
+        latency_us=row[11],
+        preset_source=row[12],
+        client_ip=row[13],
+        propagation=json.loads(row[14]) if row[14] else None,
+        session_step=row[15],
+        blocked_by=row[16],
+        origin_step=row[17],
+        origin_tool=row[18],
+        origin_detector=row[19],
+        entity_kind=row[20],
+        entity_masked=row[21],
+        argument_path=row[22],
+    )
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +66,15 @@ CREATE TABLE IF NOT EXISTS events (
     latency_us INTEGER,
     preset_source TEXT,
     client_ip TEXT,
-    propagation TEXT
+    propagation TEXT,
+    session_step INTEGER,
+    blocked_by TEXT,
+    origin_step INTEGER,
+    origin_tool TEXT,
+    origin_detector TEXT,
+    entity_kind TEXT,
+    entity_masked TEXT,
+    argument_path TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_upstream_ts ON events(upstream, ts);
@@ -73,6 +117,14 @@ class SqliteSink(AuditSink):
             "preset_source": "ALTER TABLE events ADD COLUMN preset_source TEXT",
             "client_ip": "ALTER TABLE events ADD COLUMN client_ip TEXT",
             "propagation": "ALTER TABLE events ADD COLUMN propagation TEXT",
+            "session_step": "ALTER TABLE events ADD COLUMN session_step INTEGER",
+            "blocked_by": "ALTER TABLE events ADD COLUMN blocked_by TEXT",
+            "origin_step": "ALTER TABLE events ADD COLUMN origin_step INTEGER",
+            "origin_tool": "ALTER TABLE events ADD COLUMN origin_tool TEXT",
+            "origin_detector": "ALTER TABLE events ADD COLUMN origin_detector TEXT",
+            "entity_kind": "ALTER TABLE events ADD COLUMN entity_kind TEXT",
+            "entity_masked": "ALTER TABLE events ADD COLUMN entity_masked TEXT",
+            "argument_path": "ALTER TABLE events ADD COLUMN argument_path TEXT",
         }
         for col, sql in migrations.items():
             if col not in cols:
@@ -87,8 +139,10 @@ class SqliteSink(AuditSink):
             INSERT INTO events (
                 ts, session_id, upstream, direction, method, tool,
                 action, detectors, rule, redacted_preview, latency_us,
-                preset_source, client_ip, propagation
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                preset_source, client_ip, propagation,
+                session_step, blocked_by, origin_step, origin_tool,
+                origin_detector, entity_kind, entity_masked, argument_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_ms,
@@ -105,6 +159,14 @@ class SqliteSink(AuditSink):
                 event.preset_source,
                 event.client_ip,
                 json.dumps(event.propagation) if event.propagation else None,
+                event.session_step,
+                event.blocked_by,
+                event.origin_step,
+                event.origin_tool,
+                event.origin_detector,
+                event.entity_kind,
+                event.entity_masked,
+                event.argument_path,
             ),
         )
         event_id = cursor.lastrowid
@@ -174,31 +236,14 @@ class SqliteSink(AuditSink):
             params.append(filter.session_id)
 
         sql = (
-            f"SELECT id, ts, session_id, upstream, direction, method, tool, action, "
-            f"detectors, rule, redacted_preview, latency_us, preset_source, client_ip, propagation "
+            f"SELECT {_EVENT_SELECT} "
             f"FROM events WHERE {' AND '.join(clauses)} ORDER BY ts DESC LIMIT ?"
         )
         params.append(filter.limit)
 
         async with db.execute(sql, params) as cursor:
             async for row in cursor:
-                yield AuditEvent(
-                    event_id=row[0],
-                    ts=row[1],
-                    session_id=row[2],
-                    upstream=row[3],
-                    direction=row[4],
-                    method=row[5],
-                    tool=row[6],
-                    action=row[7],
-                    detectors=json.loads(row[8] or "[]"),
-                    rule=row[9],
-                    redacted_preview=row[10],
-                    latency_us=row[11],
-                    preset_source=row[12],
-                    client_ip=row[13],
-                    propagation=json.loads(row[14]) if row[14] else None,
-                )
+                yield _event_from_row(row)
 
     async def stats_last_24h(self) -> dict[str, object]:
         db = await self._conn()
@@ -267,10 +312,8 @@ class SqliteSink(AuditSink):
         db = await self._conn()
         rows: list[AuditEvent] = []
         async with db.execute(
-            """
-            SELECT id, ts, session_id, upstream, direction, method, tool, action,
-                   detectors, rule, redacted_preview, latency_us, preset_source,
-                   client_ip, propagation
+            f"""
+            SELECT {_EVENT_SELECT}
             FROM events
             WHERE session_id = ?
             ORDER BY ts ASC, id ASC
@@ -278,25 +321,36 @@ class SqliteSink(AuditSink):
             (session_id,),
         ) as cursor:
             async for row in cursor:
-                rows.append(
-                    AuditEvent(
-                        event_id=row[0],
-                        ts=row[1],
-                        session_id=row[2],
-                        upstream=row[3],
-                        direction=row[4],
-                        method=row[5],
-                        tool=row[6],
-                        action=row[7],
-                        detectors=json.loads(row[8] or "[]"),
-                        rule=row[9],
-                        redacted_preview=row[10],
-                        latency_us=row[11],
-                        preset_source=row[12],
-                        client_ip=row[13],
-                        propagation=json.loads(row[14]) if row[14] else None,
-                    )
-                )
+                rows.append(_event_from_row(row))
+        return rows
+
+    async def payment_events(
+        self, tools: list[str], limit: int = 50
+    ) -> list[AuditEvent]:
+        db = await self._conn()
+        since = int(time.time() * 1000) - 86_400_000
+        rows: list[AuditEvent] = []
+        tool_clause = ""
+        params: list[object] = [since]
+        if tools:
+            placeholders = ",".join("?" for _ in tools)
+            tool_clause = f" OR tool IN ({placeholders})"
+            params.extend(tools)
+        params.append(limit)
+        async with db.execute(
+            f"""
+            SELECT {_EVENT_SELECT}
+            FROM events
+            WHERE ts >= ?
+              AND direction = 'request'
+              AND (blocked_by = 'origin_gate'{tool_clause})
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ) as cursor:
+            async for row in cursor:
+                rows.append(_event_from_row(row))
         return rows
 
     async def close(self) -> None:

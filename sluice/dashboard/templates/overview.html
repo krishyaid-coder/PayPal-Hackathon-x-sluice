@@ -1,51 +1,61 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Sluice Dashboard</title>
-  <link rel="stylesheet" href="static/style.css">
-</head>
-<body>
-  <header>
-    <h1>Sluice</h1>
-    <nav>
-      <a href="./">Overview</a>
-      <a href="events">Events</a>
-      <a href="sessions">Sessions</a>
-    </nav>
-  </header>
-  <main>
-    <h2>Last 24 hours</h2>
-    <p class="muted">Total events: {{ stats.total }}</p>
-    <section class="grid">
-      <article>
-        <h3>By action</h3>
-        <ul>
-          {% for action, count in stats.actions.items() %}
-          <li><a href="/events?action={{ action }}">{{ action }}</a>: {{ count }}</li>
-          {% else %}
-          <li class="muted">No events yet.</li>
-          {% endfor %}
-        </ul>
-      </article>
-      <article>
-        <h3>Top detectors</h3>
-        <ul>
-          {% for detector, count in stats.detectors.items() %}
-          <li>{{ detector }}: {{ count }}</li>
-          {% else %}
-          <li class="muted">No detector hits yet.</li>
-          {% endfor %}
-        </ul>
-      </article>
-      <article>
-        <h3>Runtime</h3>
-        <ul>
-          <li>Active taint sessions: {{ active_sessions }}</li>
-          <li>Config version: {{ version }}</li>
-        </ul>
-      </article>
-    </section>
-  </main>
-</body>
-</html>
+{% extends "base.html" %}
+{% block title %}Sluice · Overview{% endblock %}
+{% block content %}
+{% set total = stats.total or 0 %}
+{% set blocked = stats.actions.get('block', 0) %}
+{% set passed = stats.actions.get('pass', 0) %}
+<div class="page-head">
+  <h2>Last 24 hours</h2>
+  <p class="muted">Traffic through the local MCP proxy. Blocked money-moving calls show up under Payments.</p>
+</div>
+<section class="grid">
+  <article class="stat">
+    <h3>Events</h3>
+    <span class="value">{{ total }}</span>
+  </article>
+  <article class="stat danger">
+    <h3>Blocked</h3>
+    <span class="value">{{ blocked }}</span>
+  </article>
+  <article class="stat ok">
+    <h3>Passed</h3>
+    <span class="value">{{ passed }}</span>
+  </article>
+  <article class="stat warn">
+    <h3>Origin blocks</h3>
+    <span class="value">{{ origin_blocks }}</span>
+  </article>
+</section>
+<section class="grid" style="margin-top: 1rem;">
+  <article class="stat">
+    <h3>By action</h3>
+    <ul class="meter">
+      {% for action, count in stats.actions.items() %}
+      <li>
+        <a href="{{ prefix }}/events?action={{ action }}">{{ action }}</a>
+        <span class="mono">{{ count }}</span>
+      </li>
+      {% else %}
+      <li class="muted">No events yet.</li>
+      {% endfor %}
+    </ul>
+  </article>
+  <article class="stat">
+    <h3>Top detectors</h3>
+    <div class="chip-list">
+      {% for detector, count in stats.detectors.items() %}
+      <span class="chip">{{ detector }} · {{ count }}</span>
+      {% else %}
+      <span class="muted">No detector hits yet.</span>
+      {% endfor %}
+    </div>
+  </article>
+  <article class="stat">
+    <h3>Runtime</h3>
+    <ul class="meter">
+      <li><span>Taint sessions</span><span class="mono">{{ active_sessions }}</span></li>
+      <li><span>Config</span><span class="mono">v{{ version }}</span></li>
+    </ul>
+  </article>
+</section>
+{% endblock %}

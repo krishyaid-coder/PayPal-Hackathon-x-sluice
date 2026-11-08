@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Sluice{% endblock %}</title>
+  <link rel="stylesheet" href="{{ prefix }}/static/style.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="{{ prefix }}/">Sluice</a>
+    <nav>
+      <a href="{{ prefix }}/" class="{{ 'active' if page == 'overview' else '' }}">Overview</a>
+      <a href="{{ prefix }}/events" class="{{ 'active' if page == 'events' else '' }}">Events</a>
+      <a href="{{ prefix }}/sessions" class="{{ 'active' if page == 'sessions' else '' }}">Sessions</a>
+      <a href="{{ prefix }}/payments" class="{{ 'active' if page == 'payments' else '' }}">Payments</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

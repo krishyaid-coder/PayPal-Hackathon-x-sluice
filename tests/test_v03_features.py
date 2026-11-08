@@ -5,6 +5,7 @@ def test_presets_list():
     names = list_presets()
     assert "filesystem" in names
     assert "github" in names
+    assert "paypal" in names
     assert len(names) >= 5
 
 

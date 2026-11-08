@@ -113,7 +113,7 @@ def logs_cmd(
 ) -> None:
     """Query the audit log."""
     config_path = find_config(str(config) if config else None)
-    cfg = load_config(config_path)
+    cfg = load_config(config_path, require_env=False)
     audit = build_audit_sink(cfg)
     if audit is None:
         typer.echo("No audit sink configured", err=True)

@@ -9,16 +9,22 @@ import structlog
 from sluice.audit.preview import safe_preview
 from sluice.detectors import supply_chain
 from sluice.detectors.base import Hit, ScanContext
+from sluice.detectors.entities import extract_entities, fingerprint, mask, resolve_path
 from sluice.policy.engine import bootstrap_detectors, evaluate, resolve_action
 from sluice.proxy.models import AuditEvent, PolicyViolation
+from sluice.session import origin, taint
 from sluice.session import pseudonym as pseudonym_session
-from sluice.session import taint
+from sluice.session.origin import OriginTag
 
 if TYPE_CHECKING:
     from sluice.audit.sink import AuditSink
     from sluice.config.schema import SluiceConfig
 
 log = structlog.get_logger()
+
+# PII hits mean "this is an email", not "this content is untrusted".
+# Origin tags only when a poison/injection/secret detector fired on the result.
+_ORIGIN_TAG_CATEGORIES = frozenset({"prompt_injection", "tool_poisoning", "secrets"})
 
 
 class Pipeline:
@@ -27,6 +33,7 @@ class Pipeline:
         self._audit = audit
         bootstrap_detectors()
         taint.configure(cfg)
+        origin.configure(cfg)
         pseudonym_session.configure(cfg)
         supply_chain.configure(cfg)
 
@@ -91,6 +98,176 @@ class Pipeline:
             pass
         return None
 
+    def _args_from_raw(self, raw: str) -> dict:
+        try:
+            payload = json.loads(raw)
+            args = payload.get("params", {}).get("arguments")
+            return args if isinstance(args, dict) else {}
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return {}
+
+    def _origin_violation(
+        self,
+        *,
+        reason: str,
+        tag: OriginTag | None,
+        argument_path: str,
+        action: str,
+    ) -> PolicyViolation:
+        if tag is not None and reason == "inherited":
+            detail = (
+                f"Blocked: inherited origin verdict from {tag.source_tool} "
+                f"({tag.kind} {tag.masked})."
+            )
+        elif tag is not None:
+            detail = (
+                f"Blocked: {tag.kind} {tag.masked} originated in "
+                f"{tag.source_tool} ({tag.detector}) at step {tag.step}."
+            )
+        else:
+            detail = "Blocked: inherited origin verdict from a prior gated call."
+        if action == "flag":
+            detail = detail.replace("Blocked:", "Flagged:", 1)
+        return PolicyViolation(
+            rule="origin_gate",
+            detail=detail,
+            action=action,
+            detectors=["origin_gate"],
+            blocked_by="origin_gate",
+            origin_step=tag.step if tag else None,
+            origin_tool=tag.source_tool if tag else None,
+            origin_detector=tag.detector if tag else None,
+            entity_kind=tag.kind if tag else None,
+            entity_masked=tag.masked if tag else None,
+            argument_path=argument_path,
+        )
+
+    def _origin_gate(
+        self,
+        raw: str,
+        *,
+        session_id: str,
+        tool: str | None,
+        rpc_id: int | str | None,
+    ) -> PolicyViolation | None:
+        cfg = self._cfg.origin
+        if not cfg.enabled or not tool:
+            return None
+        band = cfg.band_of(tool)
+        if band is None or band == "read_only":
+            return None
+
+        index = origin.get_index()
+        args = self._args_from_raw(raw)
+        hit_tag: OriginTag | None = None
+        hit_path = ""
+        reason = ""
+
+        for spec in cfg.gated_arguments.get(tool, []):
+            values = resolve_path(args, spec.path)
+            kinds = list(spec.kinds)
+            if "inherit" in kinds:
+                for value in values:
+                    key = str(value)
+                    if index.verdict_for(session_id, key) == "block":
+                        hit_tag = index.chain_for(session_id, key)
+                        hit_path = spec.path
+                        reason = "inherited"
+                        break
+                if reason == "inherited":
+                    break
+                continue
+            if not cfg.track_amounts:
+                kinds = [kind for kind in kinds if kind != "amount"]
+            if not kinds:
+                continue
+            for value in values:
+                extracted = extract_entities(
+                    value, kinds=kinds, include_amounts=cfg.track_amounts
+                )
+                for kind, found in extracted:
+                    tag = index.lookup(session_id, fingerprint(kind, found))
+                    if tag:
+                        hit_tag = tag
+                        hit_path = spec.path
+                        reason = "origin"
+                        break
+                if reason == "origin":
+                    break
+            if reason == "origin":
+                break
+
+        if not reason:
+            index.note_call(session_id, rpc_id, tool, verdict="allow")
+            return None
+
+        action = cfg.actions.on_origin_hit.get(band, "block")
+        stored = "block" if action == "block" else ("flag" if action == "flag" else "allow")
+        index.note_call(session_id, rpc_id, tool, verdict=stored, tag=hit_tag)
+        if action == "allow":
+            return None
+        return self._origin_violation(
+            reason=reason,
+            tag=hit_tag,
+            argument_path=hit_path,
+            action=action,
+        )
+
+    def _record_origin_from_hits(
+        self,
+        *,
+        raw: str,
+        session_id: str,
+        step: int,
+        upstream: str,
+        tool: str | None,
+        hits: list[Hit],
+    ) -> None:
+        if not self._cfg.origin.enabled or not hits:
+            return
+        tagging = [
+            hit
+            for hit in hits
+            if hit.detector_id.split(".", 1)[0] in _ORIGIN_TAG_CATEGORIES
+        ]
+        if not tagging:
+            return
+        finding = tagging[0]
+        extracted = extract_entities(
+            raw, include_amounts=self._cfg.origin.track_amounts
+        )
+        index = origin.get_index()
+        for kind, value in extracted:
+            index.record(
+                OriginTag(
+                    session_id=session_id,
+                    step=step,
+                    source_server=upstream,
+                    source_tool=tool or "",
+                    detector=finding.detector_id,
+                    severity=finding.severity,
+                    kind=kind,
+                    fingerprint=fingerprint(kind, value),
+                    masked=mask(kind, value),
+                )
+            )
+
+    def _bind_gated_result(
+        self,
+        *,
+        raw: str,
+        session_id: str,
+        rpc_id: int | str | None,
+        tool: str | None,
+    ) -> None:
+        pending = origin.get_index().pending_for(session_id, rpc_id, tool)
+        if pending is None or not pending.verdict:
+            return
+        for key in origin.extract_bind_keys(raw):
+            origin.get_index().bind_result(
+                session_id, key, pending.verdict, tag=pending.tag
+            )
+
     def _method_from_raw(self, raw: str) -> str | None:
         try:
             return json.loads(raw).get("method")
@@ -137,6 +314,8 @@ class Pipeline:
         client_ip: str | None = None,
         hits: list[Hit] | None = None,
         extra_values: list[tuple[str, str]] | None = None,
+        tool: str | None = None,
+        session_step: int | None = None,
     ) -> None:
         if not self._audit:
             return
@@ -147,7 +326,7 @@ class Pipeline:
                 upstream=upstream,
                 direction=direction,
                 method=self._method_from_raw(raw),
-                tool=self._tool_from_raw(raw),
+                tool=tool or self._tool_from_raw(raw),
                 action=action,
                 detectors=violation.detectors if violation else [],
                 rule=violation.rule if violation else None,
@@ -162,6 +341,14 @@ class Pipeline:
                 preset_source=violation.preset_source if violation else None,
                 client_ip=client_ip,
                 propagation=violation.propagation if violation else None,
+                session_step=session_step,
+                blocked_by=violation.blocked_by if violation else None,
+                origin_step=violation.origin_step if violation else None,
+                origin_tool=violation.origin_tool if violation else None,
+                origin_detector=violation.origin_detector if violation else None,
+                entity_kind=violation.entity_kind if violation else None,
+                entity_masked=violation.entity_masked if violation else None,
+                argument_path=violation.argument_path if violation else None,
             )
         )
 
@@ -174,8 +361,10 @@ class Pipeline:
         client_ip: str | None = None,
     ) -> tuple[str, PolicyViolation | None]:
         start = time.perf_counter_ns()
+        step = origin.get_index().next_step(session_id)
         method = self._method_from_raw(raw)
         tool = self._tool_from_raw(raw)
+        rpc_id = self.request_id_from_raw(raw)
         context = ScanContext("request", method, tool, upstream, session_id)
 
         # Reverse-pseudonym pass first. AI-authored outbound may contain
@@ -194,11 +383,39 @@ class Pipeline:
                 violation=reverse_block,
                 latency_us=latency,
                 client_ip=client_ip,
+                tool=tool,
+                session_step=step,
             )
             log.warning(
                 "pseudonym_reverse_blocked", upstream=upstream, session_id=session_id
             )
             return raw, reverse_block
+
+        origin_violation = self._origin_gate(
+            body_reversed, session_id=session_id, tool=tool, rpc_id=rpc_id
+        )
+        if origin_violation is not None:
+            latency = (time.perf_counter_ns() - start) // 1000
+            await self._audit_write(
+                session_id=session_id,
+                upstream=upstream,
+                direction="request",
+                raw=body_reversed,
+                violation=origin_violation,
+                latency_us=latency,
+                client_ip=client_ip,
+                tool=tool,
+                session_step=step,
+            )
+            log.warning(
+                "origin_gate_" + origin_violation.action,
+                upstream=upstream,
+                session_id=session_id,
+                tool=tool,
+                path=origin_violation.argument_path,
+            )
+            if origin_violation.action == "block":
+                return body_reversed, origin_violation
 
         # If substitutions happened, skip the taint check. The user explicitly
         # opted into pseudonymized round-trip; blocking the reversed real value
@@ -275,11 +492,15 @@ class Pipeline:
                 latency_us=latency,
                 client_ip=client_ip,
                 extra_values=[("taint_leak", leak)],
+                tool=tool,
+                session_step=step,
             )
             log.warning(f"taint_leak_{action}", upstream=upstream, session_id=session_id)
             return body_reversed, violation
 
         body, violation, hits = evaluate(body_reversed, context, self._cfg)
+        if violation is None:
+            violation = origin_violation
         latency = (time.perf_counter_ns() - start) // 1000
         await self._audit_write(
             session_id=session_id,
@@ -290,6 +511,8 @@ class Pipeline:
             latency_us=latency,
             client_ip=client_ip,
             hits=hits,
+            tool=tool,
+            session_step=step,
         )
         return body, violation
 
@@ -301,12 +524,28 @@ class Pipeline:
         upstream: str,
         method: str | None = None,
         client_ip: str | None = None,
+        tool: str | None = None,
     ) -> tuple[str, PolicyViolation | None]:
         start = time.perf_counter_ns()
-        tool = self._tool_from_raw(raw) if method == "tools/call" else None
+        step = origin.get_index().next_step(session_id)
+        rpc_id = self.request_id_from_raw(raw)
+        if tool is None:
+            pending = origin.get_index().pending_for(session_id, rpc_id, None)
+            if pending is not None:
+                tool = pending.tool
+        if tool is None and method == "tools/call":
+            tool = self._tool_from_raw(raw)
         context = ScanContext("response", method, tool, upstream, session_id)
 
         body, violation, hits = evaluate(raw, context, self._cfg)
+        self._record_origin_from_hits(
+            raw=raw,
+            session_id=session_id,
+            step=step,
+            upstream=upstream,
+            tool=tool,
+            hits=hits,
+        )
         if violation is None or violation.action in ("flag", "redact"):
             taint.mark_from_hits(
                 session_id,
@@ -316,6 +555,9 @@ class Pipeline:
                 source_upstream=upstream,
                 source_method=method,
             )
+        self._bind_gated_result(
+            raw=raw, session_id=session_id, rpc_id=rpc_id, tool=tool
+        )
 
         latency = (time.perf_counter_ns() - start) // 1000
         await self._audit_write(
@@ -327,6 +569,8 @@ class Pipeline:
             latency_us=latency,
             client_ip=client_ip,
             hits=hits,
+            tool=tool,
+            session_step=step,
         )
         return body, violation
 

@@ -1,0 +1,77 @@
+# Origin-gate preset for the PayPal MCP server (@paypal/mcp).
+# Nested under origin: so `include: [preset:paypal]` merges into SluiceConfig.
+
+policy:
+  rules:
+    - detector: secrets.*
+      action: block
+      upstream: paypal
+      preset_source: paypal
+    - detector: pii.*
+      action: redact
+      upstream: paypal
+      preset_source: paypal
+    - detector: tool_poisoning.*
+      action: block
+      upstream: paypal
+      preset_source: paypal
+    - detector: prompt_injection.*
+      action: flag
+      upstream: paypal
+      preset_source: paypal
+
+origin:
+  enabled: true
+  track_amounts: false
+  bands:
+    read_only:
+      - list_invoices
+      - get_invoice
+      - get_order
+      - get_refund
+      - list_disputes
+      - get_dispute
+      - list_products
+      - show_product_details
+      - list_transactions
+      - get_merchant_insights
+      - show_subscription_details
+      - show_subscription_plan_details
+      - list_subscription_plans
+      - get_shipment_tracking
+    commits_money:
+      - create_order
+      - create_invoice
+      - send_invoice
+      - record_payment_for_invoice
+      - create_subscription
+      - update_subscription
+    moves_money:
+      - pay_order
+      - create_refund
+      - accept_dispute_claim
+      - checkout_cart
+  gated_arguments:
+    create_order:
+      - { path: "purchase_units[].payee.email_address", kinds: [email] }
+      - { path: "purchase_units[].amount.value", kinds: [amount] }
+      - { path: "payee.email_address", kinds: [email] }
+      - { path: "email", kinds: [email] }
+      - { path: "items[].unit_price", kinds: [amount] }
+    create_invoice:
+      - { path: "primary_recipients[].billing_info.email_address", kinds: [email] }
+      - { path: "items[].unit_amount.value", kinds: [amount] }
+      - { path: "recipient_email", kinds: [email] }
+    create_refund:
+      - { path: "amount.value", kinds: [amount] }
+    record_payment_for_invoice:
+      - { path: "amount.value", kinds: [amount] }
+    pay_order:
+      - { path: "order_id", kinds: [inherit] }
+    checkout_cart:
+      - { path: "cart_id", kinds: [inherit] }
+  actions:
+    on_origin_hit:
+      commits_money: block
+      moves_money: block
+    on_clean: allow

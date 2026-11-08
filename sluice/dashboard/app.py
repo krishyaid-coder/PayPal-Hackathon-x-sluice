@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,24 @@ if TYPE_CHECKING:
 
 _DASHBOARD_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_DASHBOARD_DIR / "templates"))
+
+
+def _fmt_ts(value: object) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        millis = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    dt = datetime.fromtimestamp(millis / 1000, tz=UTC)
+    return dt.strftime("%H:%M:%S")
+
+
+templates.env.filters["fmt_ts"] = _fmt_ts
+
+
+def _prefix(request: Request) -> str:
+    return request.scope.get("root_path", "") or ""
 
 
 def create_dashboard(cfg: SluiceConfig, audit: AuditSink | None) -> FastAPI:
@@ -41,6 +60,15 @@ def create_dashboard(cfg: SluiceConfig, audit: AuditSink | None) -> FastAPI:
         _auth(request)
         stats = await sqlite.stats_last_24h() if sqlite else {"actions": {}, "detectors": {}, "total": 0}
         sessions = taint.store().session_count() if taint.store() else 0
+        origin_blocks = 0
+        if sqlite:
+            origin_blocks = sum(
+                1
+                for event in await sqlite.payment_events(
+                    cfg.origin.money_tools(), limit=cfg.dashboard.page_size
+                )
+                if event.blocked_by == "origin_gate"
+            )
         return templates.TemplateResponse(
             request,
             "overview.html",
@@ -48,6 +76,9 @@ def create_dashboard(cfg: SluiceConfig, audit: AuditSink | None) -> FastAPI:
                 "stats": stats,
                 "active_sessions": sessions,
                 "version": cfg.version,
+                "origin_blocks": origin_blocks,
+                "page": "overview",
+                "prefix": _prefix(request),
             },
         )
 
@@ -75,7 +106,14 @@ def create_dashboard(cfg: SluiceConfig, audit: AuditSink | None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             "events.html",
-            {"events": rows, "upstream": upstream, "action": action, "session_id": session_id},
+            {
+                "events": rows,
+                "upstream": upstream,
+                "action": action,
+                "session_id": session_id,
+                "page": "events",
+                "prefix": _prefix(request),
+            },
         )
 
     @app.get("/sessions", response_class=HTMLResponse)
@@ -84,7 +122,25 @@ def create_dashboard(cfg: SluiceConfig, audit: AuditSink | None) -> FastAPI:
         session_rows = await sqlite.list_sessions(cfg.dashboard.page_size) if sqlite else []
         for row in session_rows:
             row["marks"] = taint.mark_count(str(row["session_id"]))
-        return templates.TemplateResponse(request, "sessions.html", {"sessions": session_rows})
+        return templates.TemplateResponse(
+            request,
+            "sessions.html",
+            {"sessions": session_rows, "page": "sessions", "prefix": _prefix(request)},
+        )
+
+    @app.get("/payments", response_class=HTMLResponse)
+    async def payments(request: Request):
+        _auth(request)
+        rows = []
+        if sqlite:
+            rows = await sqlite.payment_events(
+                cfg.origin.money_tools(), limit=cfg.dashboard.page_size
+            )
+        return templates.TemplateResponse(
+            request,
+            "payments.html",
+            {"events": rows, "page": "payments", "prefix": _prefix(request)},
+        )
 
     @app.get("/health")
     async def health():

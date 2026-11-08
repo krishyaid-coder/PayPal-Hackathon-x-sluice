@@ -1,0 +1,34 @@
+version: 1
+include:
+  - preset:paypal
+proxy:
+  host: "127.0.0.1"
+  port: 4444
+upstreams:
+  - name: filesystem
+    transport: stdio
+    command: python3
+    args: ["examples/paypal/mock_mcp.py"]
+  - name: paypal
+    transport: stdio
+    command: python3
+    args: ["examples/paypal/mock_mcp.py"]
+routing:
+  default: filesystem
+detectors:
+  pii:
+    enabled: false
+  prompt_injection:
+    enabled: true
+taint:
+  enabled: false
+origin:
+  enabled: true
+  track_amounts: false
+audit:
+  sink: sqlite
+  sqlite:
+    path: /tmp/sluice-origin-demo.db
+dashboard:
+  enabled: true
+  path: "/_sluice"

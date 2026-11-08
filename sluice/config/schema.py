@@ -109,6 +109,44 @@ class TaintConfig(BaseModel):
     provenance: bool = True
 
 
+class OriginArgSpec(BaseModel):
+    path: str
+    kinds: list[str] = Field(default_factory=list)
+
+
+class OriginActionsConfig(BaseModel):
+    on_origin_hit: dict[str, Literal["block", "flag", "allow"]] = Field(default_factory=dict)
+    on_clean: Literal["block", "flag", "allow"] = "allow"
+
+
+class OriginConfig(BaseModel):
+    """Fingerprint payees/amounts seen in detector-flagged tool results.
+
+    Amounts are off by default. An amount like 40 appears in every document
+    and will fire constantly; emails are precise and are what the demo uses.
+    """
+
+    enabled: bool = True
+    track_amounts: bool = False
+    bands: dict[str, list[str]] = Field(default_factory=dict)
+    gated_arguments: dict[str, list[OriginArgSpec]] = Field(default_factory=dict)
+    actions: OriginActionsConfig = Field(default_factory=OriginActionsConfig)
+
+    def band_of(self, tool: str | None) -> str | None:
+        if not tool:
+            return None
+        for band, tools in self.bands.items():
+            if tool in tools:
+                return band
+        return None
+
+    def money_tools(self) -> list[str]:
+        names: list[str] = []
+        for band in ("commits_money", "moves_money"):
+            names.extend(self.bands.get(band, []))
+        return names
+
+
 class PseudonymConfig(BaseModel):
     """Consistent PII pseudonymization with per-session round-trip.
 
@@ -177,6 +215,7 @@ class SluiceConfig(BaseModel):
     detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     taint: TaintConfig = Field(default_factory=TaintConfig)
+    origin: OriginConfig = Field(default_factory=OriginConfig)
     pseudonym: PseudonymConfig = Field(default_factory=PseudonymConfig)
     transports: TransportsConfig = Field(default_factory=TransportsConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)

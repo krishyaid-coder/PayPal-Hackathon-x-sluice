@@ -65,3 +65,19 @@ def test_missing_env_raises(tmp_path):
     )
     with pytest.raises(ValueError, match="environment variable not set"):
         load_config(cfg_path, write_migration=False)
+
+
+def test_missing_env_allowed_when_not_required(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "upstreams": [
+                    {"name": "x", "transport": "http", "url": "${MISSING_VAR_XYZ}"}
+                ],
+            }
+        )
+    )
+    cfg = load_config(cfg_path, write_migration=False, require_env=False)
+    assert cfg.upstreams[0].url == ""

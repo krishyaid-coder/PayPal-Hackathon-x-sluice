@@ -24,6 +24,13 @@ class PolicyViolation(BaseModel):
     detectors: list[str] = Field(default_factory=list)
     preset_source: str | None = None
     propagation: list[dict[str, str | None]] | None = None
+    blocked_by: str | None = None
+    origin_step: int | None = None
+    origin_tool: str | None = None
+    origin_detector: str | None = None
+    entity_kind: str | None = None
+    entity_masked: str | None = None
+    argument_path: str | None = None
 
 
 class AuditEvent(BaseModel):
@@ -42,3 +49,11 @@ class AuditEvent(BaseModel):
     propagation: list[dict[str, str | None]] | None = None
     event_id: int | None = None
     ts: int | None = None
+    session_step: int | None = None
+    blocked_by: str | None = None
+    origin_step: int | None = None
+    origin_tool: str | None = None
+    origin_detector: str | None = None
+    entity_kind: str | None = None
+    entity_masked: str | None = None
+    argument_path: str | None = None

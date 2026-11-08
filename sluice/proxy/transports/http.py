@@ -73,12 +73,16 @@ def create_app(pipeline: Pipeline, router: Router, cfg: SluiceConfig | None = No
             raise HTTPException(status_code=502, detail="Upstream MCP server unreachable")
 
         resp_raw = json.dumps(upstream_response.model_dump(exclude_none=True))
+        req_tool = None
+        if rpc.params and isinstance(rpc.params, dict):
+            req_tool = rpc.params.get("name")
         clean_resp, resp_violation = await pipeline.inspect_response(
             resp_raw,
             session_id=session_id,
             upstream=resolved,
             method=rpc.method,
             client_ip=client_ip,
+            tool=req_tool if isinstance(req_tool, str) else None,
         )
 
         if resp_violation and resp_violation.action == "block":

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Sluice · Payments{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h2>Payments</h2>
+  <p class="muted">One row per money-moving call. Expand a blocked row to see the origin chain: detector, masked payee, and gated argument.</p>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Step</th>
+      <th>Tool</th>
+      <th>Payee</th>
+      <th>Kind</th>
+      <th>Verdict</th>
+      <th>Chain</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for event in events %}
+    <tr class="{{ event.action }}">
+      <td class="mono">{{ event.session_step or '-' }}</td>
+      <td class="mono">{{ event.tool or '-' }}</td>
+      <td class="payee">{{ event.entity_masked or '-' }}</td>
+      <td>{{ event.entity_kind or '-' }}</td>
+      <td><span class="badge {{ event.action }}">{{ event.action }}</span></td>
+      <td>
+        {% if event.blocked_by == 'origin_gate' %}
+        <details {% if loop.first %}open{% endif %}>
+          <summary>origin chain</summary>
+          <div class="chain">
+            <div class="hop-body">
+              <small>step {{ event.origin_step or '?' }} · source</small>
+              <strong>{{ event.origin_tool or '?' }}</strong>
+              <span class="muted">{{ event.origin_detector or '?' }} fired</span>
+            </div>
+            <div class="hop-body">
+              <small>extracted</small>
+              <strong class="payee">{{ event.entity_masked or '?' }}</strong>
+            </div>
+            <div class="hop sink">
+              <div class="hop-body">
+                <small>step {{ event.session_step or '?' }} · sink</small>
+                <strong>{{ event.tool }} {{ event.argument_path or '' }}</strong>
+                <span class="badge block">blocked</span>
+              </div>
+            </div>
+          </div>
+        </details>
+        {% else %}
+        <span class="muted">clean</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="empty">No payment attempts yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
